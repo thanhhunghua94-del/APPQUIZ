@@ -44,7 +44,7 @@
           <h3>📤 Tải bài của bạn</h3>
           <label class="drop" for="fileInput">
             <span>Chọn file <b>.docx</b>, <b>.pdf</b>, <b>.txt</b> hoặc <b>.json</b></span>
-            <input type="file" id="fileInput" accept=".docx,.pdf,.txt,.md,.json">
+            <input type="file" id="fileInput" accept=".docx,.doc,.pdf,.txt,.md,.json">
           </label>
           <p class="msg" id="uploadMsg"></p>
           <details>
@@ -55,6 +55,9 @@ B. Mức độ dùng đòn bẩy
 C. Thanh toán nhanh
 D. Vòng quay hàng tồn kho
 Đáp án: B
+(hoặc chỉ ghi chữ cái đáp án "B" ở dòng
+dưới, hoặc "B (giải thích)"; câu nhiều đáp
+án ghi "ACD" hoặc "A, C, D")
 
 File Word, PDF, txt cũng viết như trên.
 App tự bỏ qua công thức, tiêu đề, câu
@@ -71,14 +74,17 @@ Hoặc file .json:
         <div class="card upload">
           <h3>🤖 Lời giải bằng AI</h3>
           <input type="password" id="aiKeyInput" class="key-input" placeholder="Dán API key vào đây" autocomplete="off" spellcheck="false">
+          <label class="remember"><input type="checkbox" id="aiAuto" checked> Tự tạo lời giải khi câu chưa có (cần key)</label>
           <label class="remember"><input type="checkbox" id="aiRemember"> Nhớ key trên trình duyệt này</label>
           <p class="msg" id="aiStatus">Chưa có key.</p>
+          <button id="aiTestBtn" class="ghost small" type="button">Thử kết nối</button>
           <details>
             <summary>Tùy chọn nâng cao</summary>
+            <label class="model-row">Hãng <select id="aiProviderSelect"><option value="">Tự nhận diện</option><option value="claude">Claude</option><option value="gemini">Gemini</option></select></label>
             <label class="model-row">Model <input type="text" id="aiModelInput" placeholder="để trống = mặc định" autocomplete="off"></label>
             <button id="aiClearBtn" class="ghost small" type="button">Xóa key</button>
           </details>
-          <p class="hint">Key chỉ lưu trong trình duyệt của bạn và gửi thẳng tới hãng AI. Hỗ trợ key Claude (sk-ant-...) và Gemini (AIza...).</p>
+          <p class="hint">Key chỉ lưu trong trình duyệt của bạn và gửi thẳng tới hãng AI. Hỗ trợ key Claude (sk-ant-...) và Gemini (AQ.... hoặc AIza...).</p>
         </div>
       </aside>
 
@@ -106,6 +112,8 @@ Hoặc file .json:
 
             <div id="quizBody">
               <h2 id="quizQuestion"></h2>
+              <div id="quizImages" class="qimgs" hidden></div>
+              <p id="multiHint" class="multi-hint" hidden></p>
               <div id="quizOptions" class="options"></div>
               <div id="quizExplain" class="explain" hidden>
                 <div class="explain-title" id="explainTitle"></div>
@@ -115,6 +123,7 @@ Hoặc file .json:
               </div>
               <div class="actions split">
                 <button id="quizPrevBtn" class="ghost">← Câu trước</button>
+                <button id="quizConfirmBtn" class="primary" hidden>✓ Xác nhận đáp án</button>
                 <button id="quizNextBtn" class="primary" hidden>Câu tiếp →</button>
               </div>
             </div>

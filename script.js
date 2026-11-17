@@ -196,6 +196,13 @@ const aiRemember = document.getElementById('aiRemember');
 const aiStatus = document.getElementById('aiStatus');
 const aiModelInput = document.getElementById('aiModelInput');
 const aiClearBtn = document.getElementById('aiClearBtn');
+const aiProviderSelect = document.getElementById('aiProviderSelect');
+const aiTestBtn = document.getElementById('aiTestBtn');
+const aiAuto = document.getElementById('aiAuto');
+const quizImages = document.getElementById('quizImages');
+const multiHint = document.getElementById('multiHint');
+const quizConfirmBtn = document.getElementById('quizConfirmBtn');
+let multiDraft = {};   // câu nhiều đáp án: các lựa chọn đang tick nhưng chưa bấm "Xác nhận" (theo số thứ tự câu)
 
 // Bộ đề có sẵn để thử ngay
 const sampleSet = {
@@ -214,8 +221,15 @@ const sampleSet = {
 function loadUploadedSets() {
   try { return JSON.parse(localStorage.getItem('quizSets')) || []; } catch (e) { return []; }
 }
+// Trả về 'ok' | 'noimg' (đã lưu nhưng bỏ ảnh vì đầy bộ nhớ) | 'fail' (không lưu được)
 function saveUploadedSets() {
-  try { localStorage.setItem('quizSets', JSON.stringify(sets.filter(s => !s.builtin))); } catch (e) {}
+  const mine = sets.filter(s => !s.builtin);
+  try { localStorage.setItem('quizSets', JSON.stringify(mine)); return 'ok'; } catch (e) {}
+  try {   // đầy bộ nhớ trình duyệt: thử lưu lại nhưng không kèm ảnh
+    const slim = mine.map((s) => Object.assign({}, s, { questions: s.questions.map((q) => { const c = Object.assign({}, q); delete c.img; return c; }) }));
+    localStorage.setItem('quizSets', JSON.stringify(slim));
+    return 'noimg';
+  } catch (e) { return 'fail'; }
 }
 
 let sets = [sampleSet, ...loadUploadedSets()];
@@ -224,7 +238,22 @@ let answers = []; // đáp án người dùng đã chọn cho từng câu (undef
 
 // ----- Đọc file: chuyển nội dung file thành mảng câu hỏi -----
 function isValid(item) {
-  return item.q && item.options.length >= 2 && item.answer >= 0 && item.answer < item.options.length;
+  if (!item || !item.q || !item.options || item.options.length < 2) return false;
+  const n = item.options.length, a = item.answer;
+  const ok = (x) => Number.isInteger(x) && x >= 0 && x < n;
+  return Array.isArray(a) ? a.length > 0 && a.every(ok) : ok(a);   // answer: 1 số (1 đáp án) hoặc mảng (nhiều đáp án)
+}
+
+// Câu trả lời `a` của người học có đúng với đáp án của câu `item` không (hỗ trợ cả câu nhiều đáp án)
+function isCorrect(item, a) {
+  if (a === undefined || a === null) return false;
+  if (Array.isArray(item.answer)) return Array.isArray(a) && a.length === item.answer.length && item.answer.every((x) => a.includes(x));
+  return a === item.answer;
+}
+
+// Đáp án đúng dạng chữ, vd "B" hoặc "A, C, D"
+function answerLabel(item) {
+  return (Array.isArray(item.answer) ? item.answer : [item.answer]).map((i) => 'ABCD'[i]).join(', ');
 }
 
 function parseJson(text) {
@@ -232,7 +261,11 @@ function parseJson(text) {
   const list = Array.isArray(data) ? data : data.questions;
   return list.map((item) => {
     let answer = item.answer;
-    if (typeof answer === 'string') answer = 'ABCD'.indexOf(answer.trim().toUpperCase()); // "B" -> 1
+    const toIndex = (x) => typeof x === 'string' ? 'ABCD'.indexOf(x.trim().toUpperCase()) : x;   // "B" -> 1
+    if (Array.isArray(answer)) { answer = answer.map(toIndex); if (answer.length === 1) answer = answer[0]; }
+    else if (typeof answer === 'string' && /^[A-Da-d](?:\s*[,;&]?\s*[A-Da-d])+$/.test(answer.trim())) {   // "A, C" hoặc "ACD"
+      answer = answer.toUpperCase().replace(/[^A-D]/g, '').split('').map(toIndex);
+    } else answer = toIndex(answer);
     return { q: String(item.q || item.question || ''), options: (item.options || []).map(String), answer: answer, explain: String(item.explain || item.explanation || '') };
   }).filter(isValid);
 }
@@ -268,7 +301,7 @@ function cleanMath(text) {
   return text
     .replace(/\\\$/g, DOLLAR)                                                  // \$ (ký hiệu đô la trong công thức) -> ký tự tạm
     .replace(/\$\$([\s\S]*?)\$\$/g, (m, math) => latexToText(math))             // $$ ... $$
-    .replace(/\$([A-Za-z\\{(][^$]*?)\$/g, (m, math) => latexToText(math))       // $ ... $
+    .replace(/\$([A-Za-z\\{(][^$\n]*?)\$/g, (m, math) => latexToText(math))     // $ ... $ (không lan sang dòng khác)
     .replace(new RegExp(DOLLAR, 'g'), '$');                                     // trả lại ký hiệu $
 }
 
@@ -315,45 +348,117 @@ async function readPdfText(file) {
 }
 
 // Đọc văn bản (từ .txt, .docx, .pdf) và TỰ LỌC ra các câu trắc nghiệm đã được định dạng sẵn.
+// Hiểu các kiểu ghi đáp án: "Đáp án: B", dòng chỉ có chữ cái "B", "B (giải thích...)", "ACD" (nhiều đáp án), "D- giải thích"...
 // Phần không đúng khuôn (tiêu đề, công thức tóm tắt, câu tự luận...) sẽ tự bị bỏ qua.
-function parseText(text) {
+const LETTERS = 'ABCD';
+const LETTER_LIST = '[A-D](?:\\s*(?:,|;|&|\\/|và|and)\\s*[A-D])+|[A-D]{2,4}';   // "A, C" hoặc "ACD"
+
+// Đọc các chữ cái đáp án ở ĐẦU chuỗi s. Trả về { letters: 'ACD', len: số ký tự đã đọc } hoặc null
+function readLetters(s) {
+  let m = s.match(new RegExp('^(' + LETTER_LIST + ')(?![A-Za-z0-9])'));
+  if (m) return { letters: m[1].replace(/[^A-D]/g, ''), len: m[0].length };
+  m = s.match(/^([A-D])(?![A-Za-z0-9])/);
+  return m ? { letters: m[1], len: 1 } : null;
+}
+
+// Xóa dòng "đóng dấu" của người soạn đề (không phải nội dung câu hỏi)
+function stripWatermark(s) {
+  return s.replace(/\(\s*soạn[^)]*\)/gi, '')
+          .replace(/SOẠN ĐỘC QUYỀN BỞI(?:\s+\p{Lu}+)*/gu, '')
+          .replace(/Soạn độc quyền bởi(?:\s+\p{Lu}\p{Ll}*)*/gu, '')
+          .replace(/\s{2,}/g, ' ').trim();
+}
+
+const normKey = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+// Chữ mô tả (alt) của ảnh có khớp với câu hỏi này không? (dùng để biết ảnh thuộc câu nào)
+function altMatches(alt, item) {
+  const a = normKey(String(alt || '').normalize('NFC').replace(/^\s*hình ảnh\s*:?/i, ''));
+  if (a.length < 15) return false;
+  const c = normKey(item.q + item.options.map((o, i) => LETTERS[i] + o).join(''));
+  const n = Math.min(a.length, c.length, 80);
+  return n >= 15 && a.slice(0, n) === c.slice(0, n);
+}
+
+function parseText(text, images) {
+  images = images || [];
   const questions = [];
   let qLines = [], options = [], letters = [], boldIdx = [], answer = -1, answerLetter = '';
   let lastItem = null, inExplain = false;   // câu vừa chốt xong, và đang đọc dở lời giải của nó không
+  let explainParen = false, explainDepth = 0; // lời giải dạng "B ( ... )" có thể kéo dài nhiều dòng cho tới khi đóng ngoặc
   let blockExplicit = false, skipped = 0;   // blockExplicit: đang đọc 1 mục có ghi "Câu N"/"Question N"; skipped: số mục bị bỏ qua
+  let curImgs = [], pendingImgs = [];       // ảnh của câu đang đọc / ảnh đứng giữa 2 câu
+
+  const count = (s, re) => (s.match(re) || []).length;
+  const opens = (s) => count(s, /[(（]/g), closes = (s) => count(s, /[)）]/g);
+
+  // Ảnh đứng giữa 2 câu: nếu chữ mô tả khớp câu sau thì thuộc câu sau, ngược lại thuộc câu trước
+  function resolvePending(item, prev) {
+    pendingImgs.forEach((im) => {
+      const toNext = !prev || (altMatches(im.alt, item) && !altMatches(im.alt, prev));
+      const target = toNext ? item : prev;
+      (target.img = target.img || []).push(im.src);
+    });
+    pendingImgs = [];
+  }
 
   // Chốt câu đang đọc dở rồi chuẩn bị đọc câu mới.
-  // Đáp án lấy theo thứ tự ưu tiên: dòng "Đáp án" > đáp án duy nhất được in đậm.
+  // Đáp án lấy theo thứ tự ưu tiên: dòng đáp án > đáp án duy nhất được in đậm.
   function finishQuestion() {
     if (answerLetter) {                       // đáp án ghi bằng chữ cái -> đổi sang vị trí trong danh sách
-      const k = letters.indexOf(answerLetter);
-      answer = k >= 0 ? k : 'ABCD'.indexOf(answerLetter);
+      const idxs = [];
+      answerLetter.split('').forEach((ch) => {
+        let k = letters.indexOf(ch);
+        if (k < 0) k = LETTERS.indexOf(ch);
+        if (k >= 0 && !idxs.includes(k)) idxs.push(k);
+      });
+      idxs.sort((a, b) => a - b);
+      answer = idxs.length === 0 ? -1 : idxs.length === 1 ? idxs[0] : idxs;   // nhiều đáp án -> mảng
     }
-    if (answer < 0 && boldIdx.length === 1) answer = boldIdx[0];
+    if (answer === -1 && boldIdx.length === 1) answer = boldIdx[0];
 
     let q = qLines.join(' ').trim();
     const head = /^(?:câu hỏi|câu|question)\s*\d+\s*(?:\([^)]*\))?\s*[.:)]?\s*/i;   // "Câu 1 (Chapter 1):", "Question 2"
     q = head.test(q) ? q.replace(head, '') : q.replace(/^\d+\s*(?:\([^)]*\))?\s*[.:)](?=\s|$)\s*/, '');
-    q = q.replace(/\(\s*soạn bởi[^)]*\)/i, '')    // bỏ "(Soạn bởi ...)"
-         .replace(/\s*\[VI\]/g, '\n[VI]')          // phần tiếng Việt xuống dòng riêng
-         .trim();
+    q = stripWatermark(q).replace(/\s*\[VI\]/g, '\n[VI]').trim();   // phần tiếng Việt xuống dòng riêng
 
-    const item = { q: q, options: options, answer: answer, explain: '' };
-    if (isValid(item)) { questions.push(item); lastItem = item; }
-    else { lastItem = null; if (blockExplicit) skipped++; }
-    qLines = []; options = []; letters = []; boldIdx = []; answer = -1; answerLetter = '';
-    blockExplicit = false; inExplain = false;
+    const item = { q: q, options: options.map(stripWatermark), answer: answer, explain: '' };
+    if (isValid(item)) {
+      const prev = questions[questions.length - 1];
+      if (curImgs.length) item.img = curImgs.map((im) => im.src);
+      resolvePending(item, prev);
+      questions.push(item);
+      lastItem = item;
+    } else {
+      lastItem = null;
+      if (options.length > 0 || blockExplicit) skipped++;
+    }
+    qLines = []; options = []; letters = []; boldIdx = []; answer = -1; answerLetter = ''; curImgs = [];
+    blockExplicit = false; inExplain = false; explainParen = false;
   }
 
   // Bỏ phần đang đọc dở nếu nó không phải câu trắc nghiệm (vd câu tự luận)
   function dropBlock() {
     if (blockExplicit && qLines.length && options.length === 0) skipped++;
-    qLines = []; blockExplicit = false;
+    qLines = []; curImgs = []; blockExplicit = false;
   }
 
   // Thêm 1 dòng vào lời giải của câu vừa chốt
   function addExplain(t) {
     lastItem.explain = lastItem.explain ? lastItem.explain + '\n' + t : t;
+  }
+
+  // Bắt đầu lời giải từ phần chữ đi kèm dòng đáp án, vd "( Rate of Return = ... )" hoặc "- giải thích"
+  function startExplain(rest) {
+    if (!lastItem || !rest) return;
+    if (/^[(（]/.test(rest)) {
+      const t = rest.replace(/^[(（]\s*/, '');
+      explainDepth = 1 + opens(t) - closes(t);
+      if (explainDepth <= 0) { addExplain(t.replace(/[)）]\s*$/, '').trim()); }
+      else { addExplain(t); inExplain = true; explainParen = true; }
+    } else {
+      addExplain(rest);
+      inExplain = true; explainParen = false;   // các dòng sau (vd "= 92,845") vẫn là lời giải, cho tới khi gặp câu mới
+    }
   }
 
   // Đọc lần lượt từng dòng, bỏ qua dòng trống
@@ -362,7 +467,7 @@ function parseText(text) {
   // Lấy dòng không trống kế tiếp (dùng để đoán một dòng thuộc câu hỏi, đáp án hay lời giải)
   function nextLine(i) {
     for (let k = i + 1; k < lines.length; k++) {
-      const t = lines[k].replace(/\u0001/g, '').trim();
+      const t = lines[k].replace(/\u0001|\u0003\d+\u0003/g, '').trim();
       if (t) return t;
     }
     return '';
@@ -370,8 +475,19 @@ function parseText(text) {
 
   lines.forEach((rawLine, idx) => {
     const bold = rawLine.startsWith('\u0001');            // dòng này có in đậm không
-    const line = rawLine.replace(/\u0001/g, '').replace(/\*\*/g, '').trim()
+    let line = rawLine.replace(/\u0001/g, '').replace(/\*\*/g, '').trim()
       .replace(/^(?:(?:[●•◦▪○·]|[-*–—])\s+)+/, '').trim();     // bỏ dấu đầu dòng (●, •, *, -) và ** của markdown
+
+    // Một số file gõ chữ cái đáp án bằng chữ "giống hệt" của bảng chữ cái khác (vd chữ Β Hy Lạp thay cho B): đổi về A-D thường
+    const lookalike = { 'Α': 'A', 'А': 'A', 'Ａ': 'A', 'Β': 'B', 'В': 'B', 'Ｂ': 'B', 'С': 'C', 'Ϲ': 'C', 'Ｃ': 'C', 'Ｄ': 'D' };
+    if (lookalike[line[0]] && /^.(?:\s*[.):：(（-]|\s|$)/.test(line)) line = lookalike[line[0]] + line.slice(1);
+
+    // Ảnh (đánh dấu \u0003N\u0003): gán cho câu đang đọc, hoặc để chờ xem thuộc câu nào
+    line = line.replace(/\u0003(\d+)\u0003/g, (m, n) => {
+      const im = images[Number(n)];
+      if (im) (qLines.length || options.length ? curImgs : pendingImgs).push(im);
+      return ' ';
+    }).trim();
     if (!line) return;
 
     // Tiêu đề phần / đường kẻ ngang: kết thúc câu hiện tại và bỏ phần không phải câu hỏi
@@ -382,45 +498,87 @@ function parseText(text) {
       return;
     }
 
-    // "Đáp án: B", "Đáp án đúng: B", "Answer: B", "Answer / Đáp án: B", "=> Đáp án đúng: B"
-    const ans = line.match(/^[=>\-–—*•\s]*(?:answer|đáp án|dap an)(?:\s*\/\s*(?:answer|đáp án|dap an))?(?:\s+(?:đúng|dung))?\s*[:：-]?\s*([A-D])\b/i);
-    const inlineAns = options.length >= 2 && line.match(/^([A-D])\s*[(（]/);   // vd: "A ( giải thích )"
-    let opt = line.match(/^([A-D])\s*[.)]\s*(.+)$/i);                           // "A. text", "A) text", "A . text"
-    if (!opt && /^[A-D]\s+\S/.test(line)) {
-      // Đáp án viết thiếu dấu chấm, vd "D 68.2% and 6.6%": chỉ nhận khi đúng thứ tự A, B, C, D.
-      // Riêng "A ..." phải có dòng "B ..." ngay sau, để không nhầm với câu hỏi bắt đầu bằng "A company..."
-      const letter = line[0];
-      const startsList = options.length === 0 && /^B\s*[.)]?\s+\S/.test(nextLine(idx));
-      if (letter === 'ABCD'[options.length] && (options.length > 0 || startsList)) {
-        opt = [line, letter, line.slice(1).trim()];
+    // ----- Có phải dòng ĐÁP ÁN không? -----
+    // Trả về { letters: 'B' | 'ACD', rest: phần chữ giải thích đi kèm } hoặc null
+    function matchAnswer() {
+      // "Đáp án: B", "Đáp án đúng: B", "Answer: B", "Answer / Đáp án: B", "=> Đáp án đúng: B", "Đáp án: A, C"
+      const lab = line.match(/^[=>\-–—*•\s]*(?:answer|đáp án|dap an)(?:\s*\/\s*(?:answer|đáp án|dap an))?(?:\s+(?:đúng|dung))?\s*[:：-]?\s*(.*)$/i);
+      if (lab) {
+        const r = readLetters(lab[1]) || (/^[a-d]\b/i.test(lab[1]) ? { letters: lab[1][0].toUpperCase(), len: 1 } : null);
+        if (r) return { letters: r.letters, rest: '' };
       }
+      if (options.length < 2) return null;     // chưa đủ đáp án A, B thì dòng này chưa thể là đáp án
+      if (/^(?:all|all of the above|all options|tất cả|cả \d+ (?:đáp án|ý))\s*\.?$/i.test(line)) return { letters: LETTERS.slice(0, options.length), rest: '' };   // "All" = chọn hết
+
+      const r = readLetters(line);
+      if (!r) return null;
+      const rest = line.slice(r.len).trim();
+      const fits = r.letters.split('').every((ch) => LETTERS.indexOf(ch) < options.length);   // chữ cái đáp án phải có trong danh sách lựa chọn
+      const nextIsOptions = /^A\s*[.)]/i.test(nextLine(idx));     // dòng sau là "A. ..." -> dòng này là câu hỏi mới, không phải đáp án
+
+      if (!rest) return { letters: r.letters, rest: '' };                          // "B", "ACD", "A, B"
+      if (nextIsOptions || !fits) return null;
+      if (/^[(（]/.test(rest)) return { letters: r.letters, rest: rest };           // "B (giải thích ...)"
+      if (/^[-–—:]\s*\S/.test(rest)) return { letters: r.letters, rest: rest.replace(/^[-–—:]\s*/, '') };   // "D- giải thích"
+      if (r.letters.length === 1 && options.length >= 4 && /^(?![A-Z][a-z])\S/.test(rest)) return { letters: r.letters, rest: rest };   // "D 1; NPV = ...", "B FV/(1+r)"
+      return null;
     }
+
+    // Lựa chọn: "A. text", "A) text", "A - text", "A text" (thiếu dấu chấm)
+    function matchOption() {
+      let opt = line.match(/^([A-D])\s*[.)]\s*(.+)$/i);                           // "A. text", "A) text", "A . text"
+      const expected = LETTERS[options.length];
+      if (!opt && expected && line[0] === expected) {
+        if (/^[A-D]\s*[-–—]\s*\S/.test(line)) {                                    // "C- text"
+          if (options.length > 0 || /^B\s*[.)\-–—]\s*\S|^B\s+\S/.test(nextLine(idx))) opt = [line, expected, line.replace(/^[A-D]\s*[-–—]\s*/, '')];
+        } else if (/^[A-D]\s+\S/.test(line)) {
+          // Viết thiếu dấu chấm, vd "D 68.2% and 6.6%": chỉ nhận khi đúng thứ tự A, B, C, D.
+          // Riêng "A ..." phải có dòng "B ..." ngay sau, để không nhầm với câu hỏi bắt đầu bằng "A company..."
+          const startsList = options.length === 0 && /^B\s*[.)]?\s+\S/.test(nextLine(idx));
+          if (options.length > 0 || startsList) opt = [line, expected, line.slice(1).trim()];
+        }
+      }
+      return opt;
+    }
+
+    const ans = matchAnswer();
+    const opt = ans ? null : matchOption();
     const label = '(?:step-by-step solution|answer guidelines|explanation|solution|lời giải(?: chi tiết)?|giải thích|hướng dẫn trả lời)';
-    const explainLabel = new RegExp('^' + label + '(?:\\s*\\/\\s*' + label + ')?\\s*[:：-]\\s*', 'i');
+    const explainLabel = new RegExp('^[(（]?\\s*' + label + '(?:\\s*\\/\\s*' + label + ')?\\s*[:：-]\\s*', 'i');
     const explicitQ = /^(?:câu hỏi|câu|question)\s*\d+/i.test(line);             // "Câu 3", "Question 3"
     const bareQ = /^\d+\s*(?:\([^)]*\))?\s*[.:)](?=\s|$)/.test(line);                    // "3." hoặc "3)"
     // Dòng "1. ..." nằm trong lời giải là bước giải, không phải câu hỏi mới (trừ khi ngay sau là đáp án A)
     const isNewQuestion = explicitQ || (bareQ && !(lastItem && inExplain && !/^[A-D]\s*[.)]/.test(nextLine(idx))));
 
-    if (ans || inlineAns) {
-      answerLetter = (ans ? ans[1] : inlineAns[1]).toUpperCase();
+    if (ans) {
+      answerLetter = ans.letters;
       finishQuestion();
-      // Dòng kiểu "A ( giải thích )": phần trong ngoặc chính là lời giải
-      if (inlineAns && lastItem) lastItem.explain = line.replace(/^[A-D]\s*[(（]\s*/, '').replace(/[)）]\s*$/, '').trim();
+      startExplain(ans.rest);                                 // "B (giải thích)": phần trong ngoặc chính là lời giải
+    } else if (lastItem && inExplain && explainParen && !explicitQ && !/^A\s*[.)]/i.test(nextLine(idx))) {
+      // Lời giải dạng "( ... )" kéo dài nhiều dòng: đọc tới khi đóng ngoặc
+      explainDepth += opens(line) - closes(line);
+      if (explainDepth <= 0) { addExplain(line.replace(/[)）]\s*$/, '').trim()); inExplain = false; explainParen = false; }
+      else addExplain(line);
     } else if (lastItem && explainLabel.test(line)) {
-      const t = line.replace(explainLabel, '');               // "Lời giải chi tiết: ..." / "Explanation / Giải thích: ..."
+      let t = line.replace(explainLabel, '');                 // "Lời giải chi tiết: ..." / "Explanation / Giải thích: ..." / "(Giải thích: ..."
+      inExplain = true; explainParen = /^[(（]/.test(line);
+      if (explainParen) {                                     // lời giải nằm trong ngoặc: đọc tới khi đóng ngoặc
+        explainDepth = 1 + opens(t) - closes(t);
+        if (explainDepth <= 0) { t = t.replace(/[)）]\s*$/, '').trim(); inExplain = false; explainParen = false; }
+      }
       if (t) addExplain(t);
-      inExplain = true;
-    } else if (lastItem && inExplain && !isNewQuestion && (opt || !/^[A-D]\s*[.)]/.test(nextLine(idx)))) {
+    } else if (lastItem && !inExplain && /^[=＝]/.test(line) && !isNewQuestion) {
+      addExplain(line);                                       // dòng bắt đầu bằng "=" ngay sau câu: là phần tính toán của lời giải
+    } else if (lastItem && inExplain && !explainParen && !isNewQuestion && (opt || !/^[A-D]\s*[.)]/.test(nextLine(idx)))) {
       addExplain(line);                                       // các dòng tiếp theo của lời giải
     } else if (opt) {
-      lastItem = null; inExplain = false;
+      lastItem = null; inExplain = false; explainParen = false;
       options.push(opt[2]);
       letters.push(opt[1].toUpperCase());
       if (bold) boldIdx.push(options.length - 1);             // nhớ lại đáp án nào đang in đậm
     } else if (isNewQuestion) {
       if (options.length > 0) finishQuestion(); else dropBlock();   // câu cũ không có dòng Đáp án -> chốt luôn
-      lastItem = null; inExplain = false;
+      lastItem = null; inExplain = false; explainParen = false;
       qLines = [line];                                        // bắt đầu câu mới
       blockExplicit = explicitQ;
     } else if (options.length > 0) {
@@ -432,12 +590,13 @@ function parseText(text) {
         options[options.length - 1] += ' ' + line;           // dòng bị ngắt giữa chừng (hay gặp ở PDF): ghép vào đáp án trước
       }
     } else {
-      lastItem = null; inExplain = false;
+      lastItem = null; inExplain = false; explainParen = false;
       qLines.push(line);                                      // câu hỏi viết nhiều dòng
     }
   });
 
   if (options.length > 0) finishQuestion(); else dropBlock();   // câu cuối cùng
+  if (pendingImgs.length && questions.length) resolvePending(questions[questions.length - 1], null);
   questions.skipped = skipped;                                  // số mục bị tự động bỏ qua
   return questions;
 }
@@ -457,9 +616,20 @@ function htmlToPlain(html) {
 // - Trong Word, 4 đáp án thường nằm chung 1 đoạn, ngăn cách bằng Shift+Enter (thẻ <br>).
 // - Dòng nào gần như toàn bộ chữ in đậm (thẻ <strong>) sẽ được gắn ký tự \u0001 ở đầu,
 //   để parseText biết đó có thể là đáp án đúng.
-function htmlToText(html) {
+// - Ảnh: được cất vào mảng `images`, và thay bằng dấu \u0003N\u0003 trên 1 dòng riêng.
+//   (Phải xử lý riêng vì chữ mô tả ảnh (alt) có thể chứa xuống dòng, làm hỏng việc tách dòng.)
+function htmlToText(html, images) {
+  images = images || [];
   const countChars = (s) => s.replace(/\s/g, '').length;
+  const decode = (s) => new DOMParser().parseFromString(s, 'text/html').body.textContent;
   return html
+    .replace(/<img\b(?:"[^"]*"|'[^']*'|[^>"'])*>/gi, (tag) => {
+      const src = (tag.match(/\ssrc="([^"]*)"/i) || [])[1];
+      if (!src) return '';
+      const alt = decode((tag.match(/\salt="([^"]*)"/i) || [, ''])[1]).slice(0, 400);
+      images.push({ src: src, alt: alt });
+      return '<br />\u0003' + (images.length - 1) + '\u0003<br />';
+    })
     .replace(/<br\s*\/?>/gi, '\n')            // <br> = xuống dòng
     .replace(/<\/(p|li|h\d)>/gi, '\n')        // hết đoạn = xuống dòng
     .split('\n')
@@ -480,18 +650,24 @@ function addSet(file, questions) {
     return;
   }
   const name = file.name.replace(/\.\w+$/, '');
-  const newSet = { name: name, questions: questions, v: 2 };   // v: 2 = bộ đề đã lưu kèm lời giải
+  const newSet = { name: name, questions: questions, v: 3 };   // v: 3 = bộ đề đã lưu kèm lời giải, nhiều đáp án, ảnh
   const old = sets.findIndex((s) => !s.builtin && s.name === name);
   if (old >= 0) sets[old] = newSet;                            // trùng tên: cập nhật bản cũ
   else sets.push(newSet);
-  saveUploadedSets();
+  const saved = saveUploadedSets();
   currentSet = old >= 0 ? old : sets.length - 1;
+  delete progressStore[name];                                  // bộ đề mới: xóa tiến độ cũ cùng tên
   renderSetSelect();
   startQuiz();
   const withExplain = questions.filter((q) => q.explain).length;
+  const multi = questions.filter((q) => Array.isArray(q.answer)).length;
+  const withImg = questions.filter((q) => q.img && q.img.length).length;
   showMessage((old >= 0 ? 'Đã cập nhật ' : 'Đã thêm ') + questions.length + ' câu hỏi từ "' + file.name + '". ' +
-    'Cả ' + questions.length + ' câu đều xác định được đáp án đúng; ' + withExplain + ' câu có lời giải chi tiết.' +
-    (questions.skipped ? ' Đã bỏ qua ' + questions.skipped + ' mục (không đủ đáp án A-D hoặc không xác định được đáp án đúng).' : ''), false);
+    'Cả ' + questions.length + ' câu đều xác định được đáp án đúng; ' + withExplain + ' câu có lời giải chi tiết' +
+    (multi ? '; ' + multi + ' câu có nhiều đáp án đúng' : '') + (withImg ? '; ' + withImg + ' câu có ảnh' : '') + '.' +
+    (questions.skipped ? ' Đã bỏ qua ' + questions.skipped + ' mục (không đủ đáp án A-D hoặc không xác định được đáp án đúng).' : '') +
+    (saved === 'noimg' ? ' ⚠ Bộ nhớ trình duyệt đầy nên ảnh chỉ giữ tới khi tải lại trang.' : '') +
+    (saved === 'fail' ? ' ⚠ Không lưu được bộ đề vào trình duyệt (đầy bộ nhớ): bộ này sẽ mất khi tải lại trang.' : ''), saved === 'fail');
 }
 
 fileInput.addEventListener('change', () => {
@@ -509,11 +685,19 @@ fileInput.addEventListener('change', () => {
           if (text.replace(/\s/g, '').length < 20) showMessage('PDF này không có chữ (có thể là file scan thành ảnh).', true);
           else addSet(file, parseText(text));
         })
-        .catch(() => showMessage('Không đọc được file PDF này.', true));
+        .catch((e) => { console.error(e); showMessage('Không đọc được file PDF này: ' + ((e && e.message) || e), true); });
     }
     fileInput.value = '';
     return;
   }
+
+  if (name.endsWith('.doc')) {
+    showMessage('File .doc (Word cũ) chưa đọc được. Hãy mở bằng Word, chọn Lưu dưới dạng → .docx rồi tải lại.', true);
+    fileInput.value = '';
+    return;
+  }
+
+  showMessage('Đang đọc file...', false);
 
   if (name.endsWith('.docx')) {
     // File Word: dùng thư viện mammoth lấy phần chữ ra, rồi đọc như file .txt
@@ -522,8 +706,11 @@ fileInput.addEventListener('change', () => {
     } else {
       file.arrayBuffer()
         .then((buffer) => mammoth.convertToHtml({ arrayBuffer: buffer }))
-        .then((result) => addSet(file, parseText(htmlToText(result.value))))
-        .catch(() => showMessage('Không đọc được file Word này.', true));
+        .then((result) => {
+          const images = [];
+          addSet(file, parseText(htmlToText(result.value, images), images));
+        })
+        .catch((e) => { console.error(e); showMessage('Không đọc được file Word này: ' + ((e && e.message) || e), true); });
     }
     fileInput.value = '';
     return;
@@ -534,7 +721,8 @@ fileInput.addEventListener('change', () => {
     try {
       addSet(file, name.endsWith('.json') ? parseJson(reader.result) : parseText(reader.result));
     } catch (e) {
-      showMessage('File bị lỗi định dạng, không đọc được.', true);
+      console.error(e);
+      showMessage('File bị lỗi định dạng, không đọc được: ' + ((e && e.message) || e), true);
     }
     fileInput.value = ''; // cho phép chọn lại cùng 1 file
   };
@@ -589,6 +777,7 @@ function openSet() {
     saved.order.length > 0 && saved.order.every((i) => i < set.questions.length) && Array.isArray(saved.answers);
   if (!valid) { startQuiz(); return; }
 
+  multiDraft = {};
   limitInput.value = saved.limit;
   shuffleInput.checked = !!saved.shuffle;
   activeOrder = saved.order;
@@ -619,6 +808,7 @@ function startQuiz() {
 
   qIndex = 0;
   answers = [];
+  multiDraft = {};
   quizResult.hidden = true;
   quizBody.hidden = false;
   showQuestion();
@@ -632,13 +822,25 @@ function showQuestion() {
   const chosen = answers[qIndex];                       // undefined = chưa trả lời câu này
   const total = activeQuestions.length;
   const answered = answers.filter((a) => a !== undefined).length;
-  const right = answers.filter((a, i) => a === activeQuestions[i].answer).length;
+  const right = answers.filter((a, i) => isCorrect(activeQuestions[i], a)).length;
+  const multi = Array.isArray(item.answer);                // câu có nhiều đáp án đúng
+  const draft = multiDraft[qIndex] || [];
 
   quizBody.hidden = false;
   quizResult.hidden = true;
   quizCount.textContent = 'Câu ' + (qIndex + 1) + '/' + total + ' · Đã làm ' + answered + ' · Đúng ' + right;
   quizBar.style.width = (answered / total * 100) + '%';
   quizQuestion.textContent = item.q;
+  quizImages.innerHTML = '';                            // ảnh đi kèm câu hỏi (nếu có)
+  (item.img || []).forEach((src) => {
+    const im = document.createElement('img');
+    im.src = src;
+    im.alt = 'Hình minh họa cho câu hỏi';
+    quizImages.appendChild(im);
+  });
+  quizImages.hidden = !(item.img && item.img.length);
+  multiHint.hidden = !multi;
+  multiHint.textContent = 'Câu này có ' + (multi ? item.answer.length : '') + ' đáp án đúng. Hãy tick tất cả rồi bấm "Xác nhận".';
   quizOptions.innerHTML = '';
 
   item.options.forEach((text, i) => {
@@ -650,6 +852,7 @@ function showQuestion() {
     const label = document.createElement('span');
     label.textContent = text;
     btn.append(letter, label);
+    if (multi && chosen === undefined && draft.includes(i)) btn.classList.add('picked');
     btn.addEventListener('click', () => chooseAnswer(i));
     quizOptions.appendChild(btn);
   });
@@ -657,9 +860,11 @@ function showQuestion() {
   quizPrevBtn.disabled = qIndex === 0;
   quizNextBtn.textContent = qIndex === total - 1 ? 'Xem kết quả' : 'Câu tiếp →';
 
+  quizConfirmBtn.hidden = true;
   if (chosen === undefined) {          // chưa làm: ẩn lời giải và nút "Câu tiếp"
     quizExplain.hidden = true;
     quizNextBtn.hidden = true;
+    if (multi) { quizConfirmBtn.hidden = false; quizConfirmBtn.disabled = draft.length === 0; }
   } else {                             // đã làm (kể cả khi quay lại xem): hiện đáp án và lời giải
     revealAnswer(chosen);
   }
@@ -670,13 +875,16 @@ function showQuestion() {
 // Hiện đáp án đúng/sai và lời giải cho câu hiện tại
 function revealAnswer(chosen) {
   const item = activeQuestions[qIndex];
-  const correct = item.answer;
+  const correctList = Array.isArray(item.answer) ? item.answer : [item.answer];   // danh sách đáp án đúng
+  const chosenList = Array.isArray(chosen) ? chosen : [chosen];                  // danh sách đã chọn
+  const correct = correctList[0];
 
   quizOptions.querySelectorAll('.opt').forEach((b, i) => {
     b.disabled = true;                                  // khóa, không cho chọn lại
-    if (i === correct) b.classList.add('correct');      // luôn tô xanh đáp án đúng
-    else if (i === chosen) b.classList.add('wrong');    // tô đỏ nếu chọn sai
-    if (i === chosen) {                                 // ghi chú "Bạn chọn" để xem lại cho rõ
+    b.classList.remove('picked');
+    if (correctList.includes(i)) b.classList.add('correct');       // luôn tô xanh đáp án đúng
+    else if (chosenList.includes(i)) b.classList.add('wrong');     // tô đỏ nếu chọn sai
+    if (chosenList.includes(i)) {                                 // ghi chú "Bạn chọn" để xem lại cho rõ
       const tag = document.createElement('span');
       tag.className = 'you';
       tag.textContent = 'Bạn chọn';
@@ -684,25 +892,27 @@ function revealAnswer(chosen) {
     }
   });
 
-  const isRight = chosen === correct;
+  const isRight = isCorrect(item, chosen);
   quizExplain.hidden = false;
   quizExplain.className = 'explain ' + (isRight ? 'good' : 'bad');
-  explainTitle.textContent = isRight ? '✓ Chính xác!' : '✗ Chưa đúng. Đáp án đúng là ' + 'ABCD'[correct];
+  explainTitle.textContent = isRight ? '✓ Chính xác!' : '✗ Chưa đúng. Đáp án đúng là ' + answerLabel(item);
   // Dùng lời giải trong file; nếu file không có thì chỉ nêu đáp án đúng
   const cur = sets[currentSet];
   const outdated = !cur.builtin && !cur.v;
   explainText.textContent = item.explain ||
-    ('Đáp án đúng: ' + 'ABCD'[correct] + '. ' + item.options[correct] + '\n' +
+    ('Đáp án đúng: ' + correctList.map((i) => 'ABCD'[i] + '. ' + item.options[i]).join('; ') + '\n' +
      (outdated ? '(Bộ đề này được lưu từ trước khi có lời giải. Hãy bấm "Xóa bộ đề" rồi tải lại file, hoặc tải lại đúng tên file để cập nhật.)'
                : '(Đáp án này lấy từ chữ in đậm/đỏ hoặc dòng đáp án trong file. File không có lời giải chi tiết cho câu này.)'));
 
   // Nút AI chỉ hiện ở câu chưa có lời giải; câu có lời giải do AI viết thì hiện ghi chú
+  const waiting = aiPending.has(item);
   aiExplainBtn.hidden = !!item.explain;
-  aiExplainBtn.disabled = false;
-  aiExplainBtn.textContent = '🤖 Tạo lời giải bằng AI';
-  aiNote.hidden = !item.ai;
-  aiNote.textContent = item.ai ? '🤖 Lời giải do AI tạo, có thể chưa chính xác. Hãy đối chiếu giáo trình.' : '';
+  aiExplainBtn.disabled = waiting;
+  aiExplainBtn.textContent = waiting ? 'Đang tạo lời giải...' : '🤖 Tạo lời giải bằng AI';
+  aiNote.hidden = !(item.ai || waiting);
+  aiNote.textContent = waiting ? '🤖 Đang nhờ AI viết lời giải...' : (item.ai ? '🤖 Lời giải do AI tạo, có thể chưa chính xác. Hãy đối chiếu giáo trình.' : '');
   quizNextBtn.hidden = false;
+  maybeAutoExplain();                       // có key + bật tự động -> tự nhờ AI viết lời giải cho câu này
 }
 
 // Bản đồ câu hỏi: mỗi câu là 1 ô vuông, xanh = đúng, đỏ = sai, bấm vào để xem lại
@@ -713,7 +923,7 @@ function renderMap(markCurrent) {
     const chip = document.createElement('button');
     chip.className = 'chip';
     chip.textContent = i + 1;
-    if (answers[i] !== undefined) chip.classList.add(answers[i] === q.answer ? 'right' : 'wrong');
+    if (answers[i] !== undefined) chip.classList.add(isCorrect(q, answers[i]) ? 'right' : 'wrong');
     if (markCurrent && i === qIndex) chip.classList.add('current');
     chip.disabled = firstOpen !== -1 && i > firstOpen;  // chưa làm tới thì chưa vào được
     chip.addEventListener('click', () => { qIndex = i; showQuestion(); });
@@ -723,13 +933,27 @@ function renderMap(markCurrent) {
 
 function chooseAnswer(chosen) {
   if (answers[qIndex] !== undefined) return;            // đã trả lời rồi thì không đổi được
+  if (Array.isArray(activeQuestions[qIndex].answer)) {  // câu nhiều đáp án: bấm để tick/bỏ tick, chờ bấm "Xác nhận"
+    const draft = multiDraft[qIndex] || [];
+    multiDraft[qIndex] = draft.includes(chosen) ? draft.filter((x) => x !== chosen) : draft.concat(chosen).sort((a, b) => a - b);
+    quizOptions.querySelectorAll('.opt').forEach((b, i) => b.classList.toggle('picked', multiDraft[qIndex].includes(i)));
+    quizConfirmBtn.disabled = multiDraft[qIndex].length === 0;
+    return;
+  }
   answers[qIndex] = chosen;
   showQuestion();                                       // vẽ lại ở trạng thái "đã trả lời"
 }
 
+quizConfirmBtn.addEventListener('click', () => {
+  const draft = multiDraft[qIndex] || [];
+  if (answers[qIndex] !== undefined || draft.length === 0) return;
+  answers[qIndex] = draft.slice();
+  showQuestion();
+});
+
 function showResult() {
   const total = activeQuestions.length;
-  const score = answers.filter((a, i) => a === activeQuestions[i].answer).length;
+  const score = answers.filter((a, i) => isCorrect(activeQuestions[i], a)).length;
   const percent = Math.round(score / total * 100);
   quizBody.hidden = true;
   quizResult.hidden = false;
@@ -774,13 +998,19 @@ deleteSetBtn.addEventListener('click', () => {
 const defaultModels = { claude: 'claude-haiku-5-5', gemini: 'gemini-flash-latest' };
 let aiKey = '';
 try { aiKey = localStorage.getItem('aiKey') || ''; } catch (e) {}
+const aiPending = new WeakSet();   // các câu đang chờ AI trả lời (tránh gọi trùng)
+let aiAutoTried = new WeakSet();   // các câu đã thử tự động rồi (nếu lỗi thì không tự gọi lại liên tục, bạn bấm nút để thử lại)
+try { aiAuto.checked = localStorage.getItem('aiAuto') !== '0'; } catch (e) {}
 
-// Đoán hãng AI theo đầu của key
+// Đoán hãng AI theo đầu của key (hoặc theo hãng người dùng tự chọn trong "Tùy chọn nâng cao")
 function detectProvider(key) {
+  if (!key) return '';
+  const manual = aiProviderSelect.value;
+  if (manual === 'claude' || manual === 'gemini') return manual;
   if (/^sk-ant-/.test(key)) return 'claude';
-  if (/^AIza/.test(key)) return 'gemini';
-  if (/^sk-/.test(key)) return 'unsupported';   // OpenAI và một số hãng khác không cho gọi trực tiếp từ trình duyệt
-  return key ? 'unknown' : '';
+  if (/^(AQ\.|AIza)/.test(key)) return 'gemini';   // Google đang đổi key Gemini từ "AIza..." sang "AQ...."
+  if (/^sk-/.test(key)) return 'unsupported';      // OpenAI và một số hãng khác không cho gọi trực tiếp từ trình duyệt
+  return 'unknown';
 }
 
 function updateAiStatus() {
@@ -792,7 +1022,7 @@ function updateAiStatus() {
     claude: '✓ Nhận ra key Claude (model mặc định ' + defaultModels.claude + ').',
     gemini: '✓ Nhận ra key Gemini (model mặc định ' + defaultModels.gemini + ').',
     unsupported: 'Key OpenAI và một số hãng khác không gọi trực tiếp từ trình duyệt được (cần có máy chủ trung gian). Hãy dùng key Claude hoặc Gemini.',
-    unknown: 'Chưa nhận ra loại key này. App hỗ trợ key Claude (sk-ant-...) và Gemini (AIza...).'
+    unknown: 'Chưa nhận ra loại key này. Hãy chọn hãng (Claude hoặc Gemini) trong "Tùy chọn nâng cao".'
   }[provider];
 }
 
@@ -808,12 +1038,18 @@ aiRemember.checked = !!aiKey;
 updateAiStatus();
 aiKeyInput.addEventListener('input', () => { aiKey = aiKeyInput.value.trim(); updateAiStatus(); saveAiKey(); });
 aiRemember.addEventListener('change', saveAiKey);
+aiProviderSelect.addEventListener('change', updateAiStatus);
 aiClearBtn.addEventListener('click', () => { aiKey = ''; aiKeyInput.value = ''; aiRemember.checked = false; saveAiKey(); updateAiStatus(); });
 
-// Gửi câu hỏi tới AI và nhận lại đoạn chữ lời giải
-async function askAI(provider, prompt) {
-  const model = aiModelInput.value.trim() || defaultModels[provider];
+// Tạo lỗi kèm mã trạng thái (401, 404, 429...) để báo lỗi dễ hiểu
+function aiError(res, data) {
+  const err = new Error((data && data.error && data.error.message) || ('Lỗi ' + res.status));
+  err.status = res.status;
+  return err;
+}
 
+// Gọi 1 hãng AI với 1 model cụ thể
+async function callProvider(provider, model, prompt) {
   if (provider === 'claude') {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -825,8 +1061,8 @@ async function askAI(provider, prompt) {
       },
       body: JSON.stringify({ model: model, max_tokens: 2000, messages: [{ role: 'user', content: prompt }] })
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error((data.error && data.error.message) || ('Lỗi ' + res.status));
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw aiError(res, data);
     // Kết quả có thể gồm nhiều khối (kể cả khối "thinking"), ta chỉ lấy các khối chữ
     return (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
   }
@@ -836,10 +1072,38 @@ async function askAI(provider, prompt) {
     headers: { 'content-type': 'application/json', 'x-goog-api-key': aiKey },
     body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error((data.error && data.error.message) || ('Lỗi ' + res.status));
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw aiError(res, data);
   const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
   return (parts || []).map((p) => p.text || '').join('');
+}
+
+// Gửi câu hỏi tới AI. Nếu bạn không tự nhập model, app thử lần lượt vài model Gemini khi 1 model báo "không tìm thấy".
+async function askAI(provider, prompt) {
+  const userModel = aiModelInput.value.trim();
+  const candidates = userModel ? [userModel]
+    : provider === 'gemini' ? [defaultModels.gemini, 'gemini-3.5-flash', 'gemini-2.5-flash']
+    : [defaultModels.claude];
+  let lastError;
+  for (const model of candidates) {
+    try { return await callProvider(provider, model, prompt); }
+    catch (e) { lastError = e; if (e.status !== 404) throw e; }
+  }
+  throw lastError;
+}
+
+// Đổi lỗi kỹ thuật thành câu dễ hiểu
+function describeAiError(e) {
+  if (e instanceof TypeError || (e && e.name === 'TypeError')) {   // fetch bị chặn (mạng, CORS hoặc trang chạy thử bị chặn gọi ra ngoài)
+    return 'Không gọi được tới dịch vụ AI. Nếu bạn đang xem bản chạy thử trên claude.ai thì trang này bị chặn gọi ra ngoài: hãy mở file index.html trên máy. Cũng có thể do mạng bị chặn.';
+  }
+  const msg = String((e && e.message) || e);
+  if (/ACCESS_TOKEN_TYPE_UNSUPPORTED/.test(msg)) return 'Google từ chối loại key này (một số tài khoản đang gặp lỗi khi Google đổi sang key "AQ."). Hãy xóa key cũ và tạo key mới ngay trong Google AI Studio. (' + msg + ')';
+  if (e.status === 401 || (e.status === 400 && /api key not valid|invalid.*key/i.test(msg))) return 'Key không được chấp nhận. Kiểm tra lại key (dán đủ, không thừa ký tự) hoặc tạo key mới. (' + msg + ')';
+  if (e.status === 403) return 'Key không có quyền dùng dịch vụ này hoặc khu vực của bạn chưa được hỗ trợ. (' + msg + ')';
+  if (e.status === 404) return 'Không tìm thấy model. Mở "Tùy chọn nâng cao" và nhập tên model khác. (' + msg + ')';
+  if (e.status === 429) return 'Key đã hết hạn mức (quota) hoặc gói miễn phí không dùng được ở dự án này. Chờ vài phút hoặc dùng key khác. (' + msg + ')';
+  return 'Lỗi từ dịch vụ AI: ' + msg;
 }
 
 function showAiNote(text) {
@@ -847,30 +1111,36 @@ function showAiNote(text) {
   aiNote.textContent = text;
 }
 
-// Bấm nút "Tạo lời giải bằng AI" ở câu chưa có lời giải
-aiExplainBtn.addEventListener('click', async () => {
-  const idx = qIndex;
+// Nhờ AI viết lời giải cho câu số idx. auto = true nghĩa là app tự gọi (không phải bạn bấm nút).
+async function generateExplanation(idx, auto) {
   const item = activeQuestions[idx];
   const chosen = answers[idx];
   const provider = detectProvider(aiKey);
 
-  if (!provider) { showAiNote('Hãy dán API key vào khung "Lời giải bằng AI" ở cột bên trái trước.'); aiKeyInput.focus(); return; }
-  if (provider === 'unsupported' || provider === 'unknown') { showAiNote(aiStatus.textContent); return; }
+  if (!provider) {
+    if (!auto) { showAiNote('Hãy dán API key vào khung "Lời giải bằng AI" ở cột bên trái trước.'); aiKeyInput.focus(); }
+    return;
+  }
+  if (provider === 'unsupported' || provider === 'unknown') { if (!auto) showAiNote(aiStatus.textContent); return; }
+  if (!item || item.explain || chosen === undefined || aiPending.has(item)) return;
 
   const prompt =
     'Bạn là gia sư môn kinh tế - tài chính. Hãy viết lời giải ngắn gọn bằng tiếng Việt (giữ nguyên thuật ngữ tiếng Anh) cho câu trắc nghiệm sau.\n\n' +
     'Câu hỏi: ' + item.q + '\n' +
     item.options.map((o, i) => 'ABCD'[i] + '. ' + o).join('\n') + '\n\n' +
-    'Đáp án đúng theo đề: ' + 'ABCD'[item.answer] + '. ' + item.options[item.answer] + '\n' +
-    (chosen !== item.answer ? 'Người học đã chọn: ' + 'ABCD'[chosen] + ' (sai).\n' : '') +
+    'Đáp án đúng theo đề: ' + (Array.isArray(item.answer) ? item.answer : [item.answer]).map((i) => 'ABCD'[i] + '. ' + item.options[i]).join('; ') + '\n' +
+    (!isCorrect(item, chosen) ? 'Người học đã chọn: ' + (Array.isArray(chosen) ? chosen : [chosen]).map((i) => 'ABCD'[i]).join(', ') + ' (sai).\n' : '') +
     '\nYêu cầu: (1) giải thích vì sao đáp án đúng là đúng, nếu có tính toán thì ghi từng bước ngắn gọn; ' +
     '(2) nếu người học chọn sai, nói ngắn gọn vì sao đáp án đã chọn sai; (3) tối đa 120 từ; ' +
     '(4) chỉ dùng chữ thường, không dùng markdown hay LaTeX; ' +
     '(5) nếu đáp án theo đề có vẻ không khớp với phép tính hoặc kiến thức đúng, hãy nói rõ điều đó.';
 
-  aiExplainBtn.disabled = true;
-  aiExplainBtn.textContent = 'Đang tạo lời giải...';
-  aiNote.hidden = true;
+  aiPending.add(item);
+  if (qIndex === idx) {
+    aiExplainBtn.disabled = true;
+    aiExplainBtn.textContent = 'Đang tạo lời giải...';
+    showAiNote('🤖 Đang nhờ AI viết lời giải...');
+  }
   try {
     const text = (await askAI(provider, prompt)).trim();
     if (!text) throw new Error('AI không trả về nội dung.');
@@ -883,13 +1153,57 @@ aiExplainBtn.addEventListener('click', async () => {
       showAiNote('🤖 Lời giải do AI tạo, có thể chưa chính xác. Hãy đối chiếu giáo trình.');
     }
   } catch (e) {
-    aiExplainBtn.disabled = false;
-    aiExplainBtn.textContent = '🤖 Tạo lời giải bằng AI';
-    const msg = String(e && e.message || e);
-    showAiNote(e instanceof TypeError
-      ? 'Không gọi được tới dịch vụ AI. Nếu bạn đang xem bản chạy thử trên claude.ai thì trang này bị chặn gọi ra ngoài: hãy mở file index.html trên máy. Cũng có thể do mạng hoặc key sai.'
-      : 'Lỗi từ dịch vụ AI: ' + msg);
+    if (qIndex === idx) {
+      aiExplainBtn.disabled = false;
+      aiExplainBtn.textContent = '🤖 Tạo lời giải bằng AI';
+      showAiNote(describeAiError(e));
+    }
+  } finally {
+    aiPending.delete(item);
   }
+}
+
+// Tự gọi AI cho câu hiện tại nếu: đã trả lời, chưa có lời giải, đã bật "Tự tạo", và có key dùng được
+function maybeAutoExplain() {
+  const item = activeQuestions[qIndex];
+  if (!item || answers[qIndex] === undefined || item.explain || !aiAuto.checked) return;
+  if (aiPending.has(item) || aiAutoTried.has(item)) return;
+  const provider = detectProvider(aiKey);
+  if (provider !== 'claude' && provider !== 'gemini') return;
+  aiAutoTried.add(item);                 // mỗi câu chỉ tự gọi 1 lần; nếu lỗi bạn bấm nút để thử lại
+  generateExplanation(qIndex, true);
+}
+
+// Bấm nút "Tạo lời giải bằng AI" (dùng khi muốn thử lại hoặc đang tắt chế độ tự động)
+aiExplainBtn.addEventListener('click', () => generateExplanation(qIndex, false));
+
+// Bật/tắt "Tự tạo lời giải" và dán key xong (rời khỏi ô nhập) thì áp dụng ngay cho câu đang xem
+aiAuto.addEventListener('change', () => {
+  try { localStorage.setItem('aiAuto', aiAuto.checked ? '1' : '0'); } catch (e) {}
+  aiAutoTried = new WeakSet();
+  maybeAutoExplain();
+});
+aiKeyInput.addEventListener('change', () => { aiAutoTried = new WeakSet(); maybeAutoExplain(); });
+
+// Nút "Thử kết nối": gửi 1 câu rất ngắn để kiểm tra key và model có chạy được không
+aiTestBtn.addEventListener('click', async () => {
+  const provider = detectProvider(aiKey);
+  if (!provider || provider === 'unsupported' || provider === 'unknown') {
+    updateAiStatus();
+    if (!provider) aiStatus.textContent = 'Hãy dán API key trước.';
+    return;
+  }
+  aiTestBtn.disabled = true;
+  aiStatus.classList.remove('error');
+  aiStatus.textContent = 'Đang thử kết nối...';
+  try {
+    const text = await askAI(provider, 'Chỉ trả lời đúng một từ: OK');
+    aiStatus.textContent = '✓ Kết nối được. AI trả lời: ' + (text.trim().slice(0, 40) || '(trống)');
+  } catch (e) {
+    aiStatus.classList.add('error');
+    aiStatus.textContent = describeAiError(e);
+  }
+  aiTestBtn.disabled = false;
 });
 
 // Mở lại đúng bộ đề đang làm dở lần trước

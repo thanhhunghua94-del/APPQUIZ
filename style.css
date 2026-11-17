@@ -157,7 +157,7 @@ select { flex: 1; padding: 10px 12px; border: 1px solid var(--line); border-radi
 
 /* Cài đặt số câu hỏi */
 .quiz-settings { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 18px; margin-bottom: 14px; font-size: 14px; color: var(--muted); }
-.quiz-settings input[type="number"] { width: 90px; margin-left: 6px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--text); font-size: 14px; }
+.quiz-settings input[type="number"] { width: 120px; margin-left: 6px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--text); font-size: 14px; }
 .quiz-settings input[type="number"]:focus { outline: 2px solid var(--primary); }
 .quiz-settings .check { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 
@@ -202,3 +202,11 @@ select { flex: 1; padding: 10px 12px; border: 1px solid var(--line); border-radi
 .upload .hint { text-align: left; margin-top: 10px; }
 .explain .small { margin-top: 12px; }
 .ai-note { margin-top: 10px; font-size: 13px; color: var(--muted); line-height: 1.5; }
+/* ===== Ảnh trong câu hỏi + câu nhiều đáp án ===== */
+.qimgs { display: grid; gap: 10px; margin: 0 0 16px; justify-items: start; }
+.qimgs img { max-width: 100%; height: auto; border-radius: 12px; border: 1px solid var(--line); background: #fff; }
+.multi-hint { margin: -8px 0 14px; font-size: 13px; color: var(--primary); font-weight: 600; }
+.opt.picked { border-color: var(--primary); background: rgba(99, 102, 241, 0.12); }
+.opt.picked .letter { background: var(--primary); color: white; }
+.opt.picked.correct { border-color: #10b981; background: rgba(16, 185, 129, 0.12); }
+.actions.split .primary:disabled { opacity: 0.45; cursor: default; transform: none; box-shadow: none; }
